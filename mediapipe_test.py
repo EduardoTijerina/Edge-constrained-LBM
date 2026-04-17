@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Stage 1 — Handshake Gesture Detector (OAK-D Pro)
-=================================================
+Stage 1 — Handshake Gesture Detector (Laptop Webcam)
+====================================================
 Master's Thesis: Low-Latency Social Gesture Recognition for Humanoid Robots
 Osaka University — Humanoid Robotics Laboratory (Ishiguro Lab)
 
-Pipeline:  OAK-D Pro → MediaPipe Hands → Gesture Heuristic → ZeroMQ PUB
+Pipeline:  Laptop webcam (cv2.VideoCapture) → MediaPipe Hands → Gesture Heuristic → ZeroMQ PUB
 Target:    ASUS Zephyrus G14 / Kubuntu  (later: Jetson Nano + OAK-D)
 
 Usage:
-    pip install opencv-python mediapipe pyzmq depthai
-    python handshake_detector.py
+    pip install opencv-python mediapipe pyzmq
+    python handshake_detector.py                  # default: /dev/video0
+    python handshake_detector.py --camera 2       # pick a different camera index
 
 Subscriber test (separate terminal):
     python -c "
@@ -43,7 +44,6 @@ warnings.filterwarnings("ignore")
 
 import cv2
 import numpy as np
-import depthai as dai
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -245,14 +245,14 @@ def _write_latency_summary(latency_samples, latency_writer) -> None:
 # ---------------------------------------------------------------------------
 
 def _run_loop(
-    q_rgb, q_depth, frame_w, frame_h,
+    cap, frame_w, frame_h,
     landmarker, pub, args,
     csv_writer, latency_writer, latency_samples,
 ) -> None:
     last_trigger_t: float = 0.0
     t_start = time.perf_counter()
     frame_idx = 0
-    latest_depth: np.ndarray | None = None
+    latest_depth: np.ndarray | None = None  # webcam has no depth — always None
     fps_t = time.perf_counter()
     fps: float = 0.0
 
@@ -268,16 +268,12 @@ def _run_loop(
     while True:
         t0 = time.perf_counter()
 
-        in_rgb = q_rgb.get()
-        if in_rgb is None:
+        ok, frame = cap.read()
+        if not ok or frame is None:
             print("[WARN] Frame grab failed — retrying")
             continue
-        frame = in_rgb.getCvFrame()
-
-        # Pull latest depth frame (non-blocking — use last good one if unavailable)
-        in_depth = q_depth.get()
-        if in_depth is not None:
-            latest_depth = in_depth.getFrame()
+        # Mirror so the preview feels like a mirror (natural for webcams)
+        frame = cv2.flip(frame, 1)
 
         # MediaPipe expects RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -420,11 +416,15 @@ def _run_loop(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Handshake gesture detector — OAK-D Pro"
+        description="Handshake gesture detector — laptop webcam"
+    )
+    parser.add_argument(
+        "--camera", type=int, default=0,
+        help="Webcam index passed to cv2.VideoCapture (default: 0)",
     )
     parser.add_argument(
         "--fps", type=int, default=30,
-        help="OAK-D Pro camera FPS (default: 30)",
+        help="Requested webcam FPS (default: 30; driver may clamp)",
     )
     parser.add_argument(
         "--width", type=int, default=640,
@@ -519,60 +519,37 @@ def main() -> None:
         cv2.namedWindow("Handshake Detector — Stage 1", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Handshake Detector — Stage 1", frame_w, frame_h)
 
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        # Fall back to default backend if V4L2 isn't available
+        cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open webcam at index {args.camera}. "
+            f"Try --camera 1 or check /dev/video* and permissions."
+        )
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_h)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or frame_w
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or frame_h
+    frame_w, frame_h = actual_w, actual_h
+
     try:
-        # ---- DepthAI v3 pipeline -----------------------------------------
-        with dai.Pipeline() as pipeline:
-            # RGB camera (CAM_A)
-            cam = pipeline.create(dai.node.Camera)
-            cam.build(dai.CameraBoardSocket.CAM_A)
-            cam_out = cam.requestOutput(
-                (frame_w, frame_h),
-                type=dai.ImgFrame.Type.BGR888i,
-                fps=args.fps,
-            )
-            q_rgb = cam_out.createOutputQueue(maxSize=4, blocking=False)
+        print(f"[CAM]  Webcam /dev/video{args.camera}  {frame_w}x{frame_h}@{args.fps}fps (no depth)")
+        print(f"[CFG]  Cooldown={args.cooldown}s  PointingThreshold={args.threshold} (normalised z)")
+        print("[INFO] Press 'q' to quit.\n")
 
-            # Left mono camera (CAM_B)
-            left_cam = pipeline.create(dai.node.Camera)
-            left_cam.build(dai.CameraBoardSocket.CAM_B)
-            left_out = left_cam.requestOutput(
-                (640, 400), type=dai.ImgFrame.Type.GRAY8, fps=args.fps,
-            )
-
-            # Right mono camera (CAM_C)
-            right_cam = pipeline.create(dai.node.Camera)
-            right_cam.build(dai.CameraBoardSocket.CAM_C)
-            right_out = right_cam.requestOutput(
-                (640, 400), type=dai.ImgFrame.Type.GRAY8, fps=args.fps,
-            )
-
-            # Stereo depth — aligned to RGB camera FOV
-            stereo = pipeline.create(dai.node.StereoDepth)
-            stereo.setDefaultProfilePreset(
-                dai.node.StereoDepth.PresetMode.FAST_ACCURACY
-            )
-            stereo.setLeftRightCheck(True)
-            stereo.setSubpixel(False)
-            stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-            stereo.setOutputSize(frame_w, frame_h)
-            left_out.link(stereo.left)
-            right_out.link(stereo.right)
-            q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
-
-            pipeline.start()
-
-            print(f"[CAM]  OAK-D Pro  RGB={frame_w}x{frame_h}@{args.fps}fps + stereo depth")
-            print(f"[CFG]  Cooldown={args.cooldown}s  PointingThreshold={args.threshold}mm")
-            print("[INFO] Press 'q' to quit.\n")
-
-            _run_loop(
-                q_rgb, q_depth, frame_w, frame_h,
-                landmarker, pub, args,
-                csv_writer, latency_writer, latency_samples,
-            )
+        _run_loop(
+            cap, frame_w, frame_h,
+            landmarker, pub, args,
+            csv_writer, latency_writer, latency_samples,
+        )
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted.")
     finally:
+        cap.release()
         landmarker.close()
         pub.close()
         ctx.term()
